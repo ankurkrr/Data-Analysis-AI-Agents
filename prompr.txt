@@ -1,0 +1,883 @@
+Assignment:
+Task: Financial Forecasting Agent for TCS
+Your task is to build a FastAPI application that acts as an AI agent capable of generating a business outlook forecast for Tata Consultancy Services (TCS).
+The agent's primary function is to move beyond simple Q&A. It must automatically find and analyze financial documents from past 1-2 quarters to generate a reasoned, qualitative forecast for the future.
+Source: You are expected to be resourceful. Find and download the necessary documents (e.g., quarterly financial reports, earnings call transcripts) for the last 1-2 quarters from a source like https://www.screener.in/company/TCS/consolidated/#documents
+Usage of AI
+At Elevation AI, we embrace AI-first solutions. For this assignment, if you have used AI, we’re keen to understand how. Please document:
+Your AI stack used and reasoning approach
+The specific tools/models employed (e.g., OCR, RAG stack, embeddings, vector DB, LLM provider, function-calling).
+What the AI actually achieved end-to-end (data sources retrieved, metrics extracted, synthesis quality).
+Guardrails and evaluation (prompting strategy, retries, grounding checks).
+Limits and tradeoffs you encountered—and how you mitigated them.
+Core Requirements
+You will build an agent with access to at least two specialized, purpose-built tools:
+FinancialDataExtractorTool: A robust tool designed to understand quarterly financial reports and extract key financial metrics (e.g., Total Revenue, Net Profit, Operating Margin).
+
+
+QualitativeAnalysisTool: A RAG-based tool that performs semantic search and analysis across 2-3 past earnings call transcripts to identify recurring themes, management sentiment, and forward-looking statements.
+Deliverables
+Generate a Forecast: The primary endpoint of your API must be able to handle a complex analytical task.
+Example Task: "Analyze the financial reports and transcripts for the last three quarters and provide a qualitative forecast for the upcoming quarter. Your forecast must identify key financial trends (e.g., revenue growth, margin pressure), summarize management's stated outlook, and highlight any significant risks or opportunities mentioned."
+
+
+Provide Structured Output: The agent's final output must be a structured JSON object. This demonstrates your ability to control the LLM and deliver predictable, machine-readable results.
+
+
+Log the Results: The agent must be served via a FastAPI endpoint, and all incoming requests and the final JSON output must be logged to a MySQL database.
+Optional, not Necessary
+MarketDataTool: As an optional bonus, you can implement a third tool that fetches live market data (e.g., current stock price) and incorporates it as another point of context in the analysis.
+Technical Stack & Expectations
+Programming Language: Python 3.10+
+Backend Framework: FastAPI
+LLM Framework: LangChain
+AI Provider: Any
+Database: MySQL 8.0
+What to Submit & The Importance of the README
+Your submission will be evaluated not just on the code, but on how easy it is for us to understand and run. Another engineer must be able to clone your repository, follow your instructions, and have the service running locally without any guesswork.
+Please provide a link to a Git repository containing:
+Source Code: All your Python scripts.
+requirements.txt: A file listing all necessary libraries.
+README.md: This must include:
+Project Overview: Your architectural approach, design choices, and how your agent chains thoughts and tools to create a forecast.
+Agent & Tool Design: A detailed explanation of each tool and the master prompt you used to guide your agent's reasoning.
+Setup Instructions: Clear, step-by-step instructions on setting up the environment, installing dependencies, and configuring all credentials (LLMs and MySQL). This must be unambiguous.
+How to Run: The exact commands to start the FastAPI service.
+How We Will Evaluate Your Submission
+Reasoning: Does the agent successfully perform a multi-step analysis? Can it synthesize data from multiple documents and tools into a coherent forecast?
+Engineering & Architecture: How well-designed are your tools and agentic chain? Is the logic for extracting financial data robust?
+Code Quality & Readability: Is your code clean, modular, and easy to maintain? Does it follow best practices for a production-ready service?
+Clarity and Reproducibility of Documentation: Can we run your project just by reading your README? How clear are your explanations of your design?
+
+
+Architecture:
+tcs-forecast-agent/
+├─ app/
+│  ├─ main.py
+│  ├─ api/
+│  │  ├─ endpoints.py
+│  ├─ agents/
+│  │  ├─ forecast_agent.py
+│  ├─ data/
+│  │  ├─ sample_pdf
+│  ├─ services/
+│  │  ├─ document_fetcher.py
+│  ├─ db/
+│  │  ├─ mysql_client.py
+│  ├─ utils/
+│  │  └─ number_parsing.py
+│  ├─ llm/
+│  │  ├─ openrouter_llm.py
+|  |- tools/
+│  ├─ financial_extractor_tool.py
+│  ├─ qualitative_analysis_tool.py
+│  └─ data/               # sample pdfs + transcripts for tests
+├─ requirements.txt
+├─ README.md
+└─ .env.example
+
+Codes:
+# app/agents/forecast_agent.py
+from langchain.agents import Tool, initialize_agent, AgentType
+from langchain.prompts import PromptTemplate
+from app.llm.openrouter_llm import OpenRouterLLM
+from app.tools.financial_extractor_tool import extract_financial_data
+from app.tools.qualitative_analysis_tool import QualitativeAnalysisTool
+import json, os, time
+from jsonschema import validate, ValidationError
+
+# JSON Schema for final forecast (simplified but strict)
+FORECAST_SCHEMA = {
+    "type": "object",
+    "required": ["metadata", "numeric_trends", "qualitative_summary", "forecast", "risks_and_opportunities", "sources"],
+    "properties": {
+        "metadata": {
+            "type": "object",
+            "properties": {
+                "ticker": {"type": "string"},
+                "request_id": {"type": "string"},
+                "analysis_date": {"type": "string", "format":"date-time"},
+                "quarters_analyzed": {"type": "array"}
+            },
+            "required": ["ticker", "request_id", "analysis_date"]
+        },
+        "numeric_trends": {"type":"object"},
+        "qualitative_summary": {"type":"object"},
+        "forecast": {"type":"object"},
+        "risks_and_opportunities": {"type":"object"},
+        "sources": {"type":"array"}
+    }
+}
+
+# Synthesis instruction template
+SYNTHESIS_INSTRUCTION = """
+You are an expert sell-side analyst. Given the structured tool outputs (financial metrics and qualitative analysis), produce a single JSON object adhering EXACTLY to the schema described below.
+Do NOT invent numbers or facts — every factual claim must reference at least one source from the provided 'tools' context (tool name + doc_meta name + chunk/page).
+If a metric is missing in the tools data, set its value to null and confidence to 0.2.
+
+JSON Schema (short): keys: metadata, numeric_trends, qualitative_summary, forecast, risks_and_opportunities, sources.
+- metadata: ticker, request_id, analysis_date, quarters_analyzed
+- numeric_trends: metric keys with values array (period,value,unit) and computed qoq/yoY where possible.
+- qualitative_summary: themes[], management_sentiment{score,summary}, forward_guidance[]
+- forecast: outlook_text, numeric_projection (low/high/unit), confidence (0-1)
+- risks_and_opportunities: risks[] and opportunities[]
+- sources: array of {tool, doc_meta_name, location}
+
+Return ONLY valid JSON that validates against the schema. No extra text.
+"""
+
+class ForecastAgent:
+    def __init__(self):
+        self.llm = OpenRouterLLM()
+        self.qualitative_instance = QualitativeAnalysisTool()
+
+    def run(self, ticker: str, request_id: str, quarters: int=3, sources=None, include_market: bool=False):
+        from app.services.document_fetcher import DocumentFetcher
+        fetcher = DocumentFetcher()
+        docs = fetcher.fetch_quarterly_documents(ticker, quarters, sources)
+        reports = docs.get("reports", [])
+        transcripts = docs.get("transcripts", [])
+
+        # Step 1: financial extraction
+        fin_out = extract_financial_data(reports)
+
+        # Step 2: qualitative analysis
+        qual_out = self.qualitative_instance.analyze(transcripts)
+
+        # Build context for LLM
+        context = {"financial": fin_out, "qualitative": qual_out, "docs": docs, "request_id": request_id, "ticker": ticker}
+
+        # Build prompt: include SYNTHESIS_INSTRUCTION + compact JSON context
+        prompt_obj = {
+            "instruction": SYNTHESIS_INSTRUCTION,
+            "context": context
+        }
+        prompt_text = json.dumps(prompt_obj, indent=2)
+
+        # Attempt generation + validation with retries
+        attempts = []
+        max_attempts = 3
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                raw = self.llm._call(prompt_text)
+            except Exception as e:
+                raw = f"ERROR_CALLING_LLM: {str(e)}"
+            attempts.append({"attempt": attempt, "raw": raw})
+            # Try parse
+            try:
+                parsed = json.loads(raw)
+            except Exception as e:
+                last_exc = ("json_parse", str(e))
+                # If we didn't get JSON, craft a repair prompt and retry (ask LLM to output only JSON)
+                prompt_text = json.dumps({
+                    "instruction": "The previous response was not valid JSON. Please return ONLY the valid JSON object required by the schema. Previous response: " + raw,
+                    "context": context
+                }, indent=2)
+                continue
+            # Validate against schema
+            try:
+                validate(instance=parsed, schema=FORECAST_SCHEMA)
+                # success
+                final = {
+                    "metadata": {"ticker": ticker, "request_id": request_id, "analysis_date": __import__("datetime").datetime.utcnow().isoformat(), "quarters_analyzed": [r.get("name") for r in reports]},
+                    "tools": {"financial": fin_out, "qualitative": qual_out},
+                    "synthesis": parsed,
+                    "synthesis_attempts": attempts
+                }
+                return final
+            except ValidationError as ve:
+                last_exc = ("schema_validation", str(ve))
+                # prepare repair prompt instructing LLM to repair only the invalid parts and return valid JSON
+                repair_instruction = f"The previously returned JSON failed schema validation: {str(ve)}. Please return a corrected JSON that strictly follows the schema and the rules (no explanation). Use only the provided 'context'."
+                prompt_text = json.dumps({"instruction": repair_instruction, "context": context}, indent=2)
+                continue
+
+        # if here: all attempts failed
+        return {
+            "metadata": {"ticker": ticker, "request_id": request_id, "analysis_date": __import__("datetime").datetime.utcnow().isoformat(), "quarters_analyzed": [r.get("name") for r in reports]},
+            "tools": {"financial": fin_out, "qualitative": qual_out},
+            "synthesis": {"error": "generation_failed", "last_exc": last_exc},
+            "synthesis_attempts": attempts
+        }
+
+app/api/endpoints.py:
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from uuid import uuid4
+from app.agents.forecast_agent import ForecastAgent
+from app.db.mysql_client import MySQLClient
+
+router = APIRouter()
+agent = ForecastAgent()
+db = MySQLClient()
+
+class ForecastRequest(BaseModel):
+    quarters: int = 3
+    sources: list = ["screener", "company-ir"]
+    include_market: bool = False
+
+@router.post("/forecast/tcs")
+async def forecast_tcs(req: ForecastRequest):
+    request_id = str(uuid4())
+    payload = req.dict()
+    db.log_request(request_id, payload)
+    try:
+        result = agent.run(ticker="TCS", request_id=request_id, quarters=req.quarters, sources=req.sources, include_market=req.include_market)
+        db.log_result(request_id, result)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/status/{request_id}")
+async def status(request_id: str):
+    return db.get_result(request_id)
+
+db/mysql_client.py:
+import mysql.connector
+import os
+import json
+from dotenv import load_dotenv
+
+load_dotenv()
+
+MYSQL_CONFIG = {
+    "host": os.getenv("MYSQL_HOST", "localhost"),
+    "port": int(os.getenv("MYSQL_PORT", 3306)),
+    "user": os.getenv("MYSQL_USER", "root"),
+    "password": os.getenv("MYSQL_PASSWORD", ""),
+    "database": os.getenv("MYSQL_DB", "tcs_forecast"),
+}
+
+class MySQLClient:
+    def __init__(self):
+        db_name = MYSQL_CONFIG["database"]
+
+        # Step 1: Connect to MySQL *without* database to ensure it exists
+        temp_conn = mysql.connector.connect(
+            host=MYSQL_CONFIG["host"],
+            port=MYSQL_CONFIG["port"],
+            user=MYSQL_CONFIG["user"],
+            password=MYSQL_CONFIG["password"]
+        )
+        temp_cursor = temp_conn.cursor()
+        temp_cursor.execute(f"CREATE DATABASE IF NOT EXISTS {db_name}")
+        temp_conn.commit()
+        temp_cursor.close()
+        temp_conn.close()
+
+        # Step 2: Connect to the actual database
+        self.conn = mysql.connector.connect(**MYSQL_CONFIG)
+        self._ensure_tables()
+
+    def _ensure_tables(self):
+        cur = self.conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS requests (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            request_uuid VARCHAR(64) UNIQUE,
+            payload JSON,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS results (
+            id BIGINT AUTO_INCREMENT PRIMARY KEY,
+            request_uuid VARCHAR(64),
+            result_json JSON,
+            tools_raw JSON,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            INDEX (request_uuid)
+        )
+        """)
+        self.conn.commit()
+        cur.close()
+
+    def log_request(self, request_uuid: str, payload: dict):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO requests (request_uuid, payload) VALUES (%s, %s)",
+            (request_uuid, json.dumps(payload)),
+        )
+        self.conn.commit()
+        cur.close()
+
+    def log_result(self, request_uuid: str, result: dict, tools_raw: dict = None):
+        cur = self.conn.cursor()
+        cur.execute(
+            "INSERT INTO results (request_uuid, result_json, tools_raw) VALUES (%s, %s, %s)",
+            (request_uuid, json.dumps(result), json.dumps(tools_raw or {})),
+        )
+        self.conn.commit()
+        cur.close()
+
+    def get_result(self, request_uuid: str):
+        cur = self.conn.cursor(dictionary=True)
+        cur.execute(
+            "SELECT * FROM results WHERE request_uuid=%s ORDER BY created_at DESC LIMIT 1",
+            (request_uuid,),
+        )
+        r = cur.fetchone()
+        cur.close()
+        return r
+
+# app/llm/openrouter_llm.py
+from langchain.llms.base import LLM
+from typing import Any, List, Optional
+import requests
+import os
+from pydantic import Field
+
+class OpenRouterLLM(LLM):
+    """Custom LLM wrapper for OpenRouter free models"""
+
+    openrouter_api_key: str = Field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY"))
+    model: str = Field(default="deepseek/deepseek-chat-v3.1:free")
+    base_url: str = Field(default="https://openrouter.ai/api/v1/chat/completions")
+
+    @property
+    def _llm_type(self) -> str:
+        return "openrouter"
+
+    def _call(self, prompt: str, stop: Optional[List[str]] = None) -> str:
+        """Send user prompt to OpenRouter model"""
+        if not self.openrouter_api_key:
+            raise ValueError("Missing OpenRouter API key. Set OPENROUTER_API_KEY in your environment.")
+
+        headers = {
+            "Authorization": f"Bearer {self.openrouter_api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+
+        response = requests.post(self.base_url, headers=headers, json=payload)
+
+        if response.status_code != 200:
+            raise ValueError(f"OpenRouter API Error: {response.status_code} - {response.text}")
+
+        data = response.json()
+        return data["choices"][0]["message"]["content"]
+
+
+
+
+# app/services/document_fetcher.py
+import os
+import re
+import requests
+from bs4 import BeautifulSoup
+from typing import List, Dict
+from urllib.parse import urljoin, urlparse
+import hashlib
+import time
+
+DOWNLOAD_DIR = "data/downloads"
+SCREENER_COMPANY_URL_TEMPLATE = "https://www.screener.in/company/{ticker}/consolidated/"
+
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+def _download_file(url: str, dest_dir: str = DOWNLOAD_DIR) -> str:
+    """
+    Download a file and return local path. Name by SHA1(url)+basename to avoid collisions.
+    """
+    try:
+        resp = requests.get(url, stream=True, timeout=30)
+        resp.raise_for_status()
+        # guess filename
+        parsed = urlparse(url)
+        base = os.path.basename(parsed.path) or "file"
+        url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()[:8]
+        fname = f"{url_hash}_{base}"
+        local_path = os.path.join(dest_dir, fname)
+        with open(local_path, "wb") as f:
+            for chunk in resp.iter_content(1024*64):
+                if chunk:
+                    f.write(chunk)
+        return local_path
+    except Exception:
+        return ""
+
+def _is_pdf_link(href: str) -> bool:
+    if not href:
+        return False
+    href = href.split('?')[0].lower()
+    return href.endswith(".pdf")
+
+def _looks_like_transcript_text(text: str) -> bool:
+    if not text:
+        return False
+    text = text.lower()
+    keys = ["transcript", "earnings call", "concall", "conference call", "management commentary", "transcribed"]
+    return any(k in text for k in keys)
+
+def fetch_quarterly_documents(ticker: str, quarters: int, sources: List[str]=None) -> Dict[str, List[Dict]]:
+    """
+    Scrape Screener.in company consolidated page for documents.
+    Returns:
+       {"reports":[{"name":..., "local_path":...}], "transcripts":[{"name":..., "local_path":...}]}
+    """
+    url = SCREENER_COMPANY_URL_TEMPLATE.format(ticker=ticker)
+    reports = []
+    transcripts = []
+
+    try:
+        headers = {"User-Agent": "tcs-forecast-agent/0.1 (+https://example.com)"}
+        resp = requests.get(url, headers=headers, timeout=20)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        # Screener has a div with id 'documents' or a section — search for anchors containing '.pdf'
+        # Find all anchors inside the page
+        anchors = soup.find_all("a", href=True)
+        pdf_links = []
+        for a in anchors:
+            href = a["href"]
+            # absolute url
+            full = urljoin(url, href)
+            if _is_pdf_link(full):
+                # check if anchor text suggests 'results', 'quarterly' etc
+                text = (a.get_text() or "").strip()
+                pdf_links.append({"href": full, "text": text})
+            else:
+                # also capture anchors that look like pdf but use query param
+                if "pdf" in full.lower() and ".pdf" in full.lower():
+                    pdf_links.append({"href": full, "text": (a.get_text() or "").strip()})
+
+        # deduplicate by href
+        seen = set()
+        pdf_links_unique = []
+        for p in pdf_links:
+            if p["href"] not in seen:
+                seen.add(p["href"])
+                pdf_links_unique.append(p)
+
+        # Sort: prefer those whose anchor text mentions 'quarter' or 'results' or 'consolidated'
+        def score_pdf_link(p):
+            text = p["text"].lower()
+            s = 0
+            if "quarter" in text or "q" in text:
+                s += 2
+            if "results" in text or "consolidated" in text:
+                s += 2
+            if "annual" in text:
+                s -= 1
+            return -s  # negative for reverse sort
+
+        pdf_links_unique = sorted(pdf_links_unique, key=score_pdf_link)
+
+        # Download top N PDFs
+        for idx, p in enumerate(pdf_links_unique[:max(quarters*2, 6)]):
+            local = _download_file(p["href"])
+            if local:
+                name = p["text"] or os.path.basename(local)
+                reports.append({"name": name, "local_path": local, "source_url": p["href"]})
+            time.sleep(0.5)
+
+        # Now try to find transcripts: anchors whose text looks like transcript keywords or link targets containing 'transcript' or 'concall'
+        anchors = soup.find_all("a", href=True)
+        transcript_candidates = []
+        for a in anchors:
+            txt = (a.get_text() or "").strip()
+            href = urljoin(url, a["href"])
+            if _looks_like_transcript_text(txt) or 'transcript' in href.lower() or 'concall' in href.lower() or 'conference-call' in href.lower():
+                transcript_candidates.append({"href": href, "text": txt})
+
+        # De-duplicate and download if pdf; otherwise store external link metadata and try to download if pointing to a .txt or .html that looks like transcript
+        seen_t = set()
+        for t in transcript_candidates:
+            if t["href"] in seen_t:
+                continue
+            seen_t.add(t["href"])
+            href = t["href"]
+            # If it's a PDF, download
+            if _is_pdf_link(href):
+                local = _download_file(href)
+                if local:
+                    transcripts.append({"name": t["text"] or os.path.basename(local), "local_path": local, "source_url": href})
+            else:
+                # try fetching the page and parse text, save as .txt
+                try:
+                    r2 = requests.get(href, timeout=20)
+                    r2.raise_for_status()
+                    soup2 = BeautifulSoup(r2.text, "html.parser")
+                    # heuristics: find divs that look like transcript text
+                    body_text = soup2.get_text(separator="\n")
+                    # Save a local txt file
+                    if len(body_text) > 200:
+                        fname = os.path.join(DOWNLOAD_DIR, hashlib.sha1(href.encode()).hexdigest()[:8] + "_transcript.txt")
+                        with open(fname, "w", encoding="utf-8") as f:
+                            f.write(body_text)
+                        transcripts.append({"name": t["text"] or href, "local_path": fname, "source_url": href})
+                except Exception:
+                    # skip if cannot download
+                    pass
+
+        # If transcripts empty, try third-party search fallback (DuckDuckGo unofficial via html query)
+        if not transcripts:
+            # naive attempt: search quick for 'TCS earnings call transcript' on google is not allowed here; skip
+            pass
+
+    except Exception:
+        # If any error, fall back to returning any files in tests/data for local dev
+        # Provide a fallback to local test files (developer should place sample files)
+        fallback_reports = [
+            {"name":"Q1_SAMPLE","local_path":"tests/data/sample_report_q1.pdf"},
+            {"name":"Q4_SAMPLE","local_path":"tests/data/sample_report_q4.pdf"},
+            {"name":"Q3_SAMPLE","local_path":"tests/data/sample_report_q3.pdf"},
+        ]
+        fallback_transcripts = [
+            {"name":"Q1_TRANSCRIPT","local_path":"tests/data/sample_transcript_q1.txt"},
+            {"name":"Q4_TRANSCRIPT","local_path":"tests/data/sample_transcript_q4.txt"},
+            {"name":"Q3_TRANSCRIPT","local_path":"tests/data/sample_transcript.txt"}
+        ]
+        return {"reports": fallback_reports[:quarters], "transcripts": fallback_transcripts[:max(1, quarters-1)]}
+
+    # Final limit to requested quarters
+    return {"reports": reports[:quarters], "transcripts": transcripts[:max(1, quarters-1)]}
+
+class DocumentFetcher:
+    def __init__(self):
+        pass
+
+    def fetch_quarterly_documents(self, ticker, quarters, sources=None):
+        return fetch_quarterly_documents(ticker, quarters, sources)
+
+
+# app/tools/financial_extractor_tool.py
+import os
+import re
+import json
+import tempfile
+from typing import List, Dict, Any, Optional
+import pdfplumber
+from app.utils.number_parsing import parse_inr_number
+from pdf2image import convert_from_path
+import pytesseract
+from tqdm import tqdm
+
+# Camelot import may fail if system deps missing; use try/except
+try:
+    import camelot
+    _HAS_CAMELOT = True
+except Exception:
+    _HAS_CAMELOT = False
+
+def _extract_tables_with_camelot(pdf_path: str) -> List[Dict[str, Any]]:
+    """
+    Use camelot to extract tables and try to find financial cells with labels.
+    Returns list of discovered candidate {label, value, table_html, page}
+    """
+    results = []
+    if not _HAS_CAMELOT:
+        return results
+    try:
+        # flavor 'stream' is often good for financial PDFs; try both stream and lattice
+        tables = []
+        try:
+            tables += camelot.read_pdf(pdf_path, pages='all', flavor='lattice')
+        except Exception:
+            pass
+        try:
+            tables += camelot.read_pdf(pdf_path, pages='all', flavor='stream')
+        except Exception:
+            pass
+
+        for t in tables:
+            df = t.df  # pandas DataFrame
+            html = t.to_html()
+            page = t.page
+            # scan cells for labels like 'Total Revenue' or 'Net Profit'
+            for r_idx in range(df.shape[0]):
+                for c_idx in range(df.shape[1]):
+                    cell = str(df.iat[r_idx, c_idx])
+                    if re.search(r'\b(Total\s+Revenue|Revenue|Net\s+Profit|Operating\s+Profit|EBITDA|EPS)\b', cell, re.I):
+                        # Find numeric cell in same row or next column
+                        numeric_val = None
+                        # search row to right
+                        for k in range(c_idx+1, min(df.shape[1], c_idx+4)):
+                            cand = df.iat[r_idx, k]
+                            v = parse_inr_number(str(cand))
+                            if v is not None:
+                                numeric_val = v
+                                break
+                        # search same column below (common layout)
+                        if numeric_val is None:
+                            for k in range(r_idx+1, min(df.shape[0], r_idx+6)):
+                                cand = df.iat[k, c_idx]
+                                v = parse_inr_number(str(cand))
+                                if v is not None:
+                                    numeric_val = v
+                                    break
+                        if numeric_val is not None:
+                            results.append({
+                                "label": cell.strip(),
+                                "value": numeric_val,
+                                "unit": "INR_Cr",
+                                "page": page,
+                                "confidence": 0.85,
+                                "table_html": html
+                            })
+    except Exception:
+        pass
+    return results
+
+def _extract_text_with_pdfplumber(pdf_path: str) -> str:
+    text = ""
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            for page in pdf.pages:
+                t = page.extract_text()
+                if t:
+                    text += "\n\n" + t
+    except Exception:
+        pass
+    return text
+
+def _ocr_pdf(pdf_path: str, dpi:int=200, max_pages: Optional[int]=None) -> str:
+    """
+    Convert PDF pages to images and run OCR with pytesseract.
+    """
+    text = ""
+    try:
+        pages = convert_from_path(pdf_path, dpi=dpi)
+        if max_pages:
+            pages = pages[:max_pages]
+        for page in pages:
+            txt = pytesseract.image_to_string(page)
+            text += "\n\n" + txt
+    except Exception:
+        pass
+    return text
+
+def extract_financial_data(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Robust extractor: given a list of reports (with local_path), return metrics discovered.
+    Output format:
+      {"tool":"FinancialDataExtractorTool", "results": [{"doc_meta": {...}, "metrics": {...}, "raw": {...}}]}
+    """
+    outputs = []
+    for r in reports:
+        path = r.get("local_path")
+        doc_meta = r
+        metrics = {}
+        raw = {"camelot": [], "pdfplumber_snippets": [], "ocr_snippets": []}
+        if not path or not os.path.exists(path):
+            outputs.append({"doc_meta": doc_meta, "metrics": metrics, "raw": {"error":"file_missing"}})
+            continue
+
+        # 1) Try camelot table extraction (best)
+        camelot_hits = _extract_tables_with_camelot(path)
+        raw["camelot"] = camelot_hits
+        for hit in camelot_hits:
+            label = hit["label"]
+            val = hit["value"]
+            # normalize label to metric key
+            key = None
+            l = label.lower()
+            if "revenue" in l:
+                key = "total_revenue"
+            elif "net profit" in l or ("net" in l and "profit" in l):
+                key = "net_profit"
+            elif "operating profit" in l:
+                key = "operating_profit"
+            elif "ebitda" in l:
+                key = "ebitda"
+            elif "eps" in l:
+                key = "eps"
+            if key and key not in metrics:
+                metrics[key] = {"value": val, "unit": hit.get("unit","INR_Cr"), "confidence": hit.get("confidence", 0.7), "source": {"method":"camelot", "page": hit.get("page")}, "label": label}
+
+        # 2) If essential metrics missing, try pdfplumber text search
+        text = _extract_text_with_pdfplumber(path)
+        if text:
+            # collect context snippets
+            for m in re.finditer(r'([A-Za-z &\.\-]{2,40})\s*[:\-]?\s*₹?\s*([0-9,\.\s]+)\s*(Cr|Crore|mn|million)?', text, flags=re.I):
+                label = m.group(1)
+                numfrag = m.group(2)
+                unit = m.group(3)
+                val = parse_inr_number("₹ " + numfrag + (" " + unit if unit else ""))
+                snippet = text[m.start()-80:m.end()+80]
+                raw["pdfplumber_snippets"].append({"label": label.strip(), "value": val, "unit": unit, "context": snippet[:500]})
+            # heuristics for certain labels
+            for label in ["Total Revenue", "Net Profit", "Operating Profit", "EBITDA", "EPS"]:
+                idx = text.lower().find(label.lower())
+                if idx != -1:
+                    frag = text[idx: idx+300]
+                    val = parse_inr_number(frag)
+                    if val is not None:
+                        key = label.lower().replace(" ", "_")
+                        # map to standard keys
+                        if "revenue" in label.lower():
+                            key = "total_revenue"
+                        elif "net profit" in label.lower():
+                            key = "net_profit"
+                        elif "operating profit" in label.lower():
+                            key = "operating_profit"
+                        elif "ebitda" in label.lower():
+                            key = "ebitda"
+                        elif "eps" in label.lower():
+                            key = "eps"
+                        if key not in metrics:
+                            metrics[key] = {"value": val, "unit": "INR_Cr", "confidence": 0.6, "source": {"method":"pdfplumber"}, "label": label}
+        # 3) OCR fallback if still missing core metrics
+        core_needed = any(k not in metrics for k in ["total_revenue", "net_profit"])
+        if core_needed:
+            ocr_text = _ocr_pdf(path, dpi=200, max_pages=5)
+            if ocr_text:
+                # grab snippets similar to pdfplumber
+                for label in ["Total Revenue", "Net Profit", "Operating Profit", "EBITDA", "EPS"]:
+                    idx = ocr_text.lower().find(label.lower())
+                    if idx != -1:
+                        frag = ocr_text[idx: idx+300]
+                        val = parse_inr_number(frag)
+                        if val is not None:
+                            key = label.lower().replace(" ", "_")
+                            if "revenue" in label.lower():
+                                key = "total_revenue"
+                            elif "net profit" in label.lower():
+                                key = "net_profit"
+                            if key not in metrics:
+                                metrics[key] = {"value": val, "unit": "INR_Cr", "confidence": 0.45, "source": {"method":"ocr"}, "label": label}
+                # record some OCR snippets for reference
+                raw["ocr_snippets"].append(ocr_text[:2000])
+
+        outputs.append({"doc_meta": doc_meta, "metrics": metrics, "raw": raw})
+    return {"tool": "FinancialDataExtractorTool", "results": outputs}
+
+
+app/tools/qualitative_anlysis_tool.py:
+"""
+QualitativeAnalysisTool: index transcripts with sentence-transformers + FAISS
+and provide retrieval + short analysis outputs suitable for RAG.
+"""
+
+from typing import List, Dict, Any
+import os, json
+from sentence_transformers import SentenceTransformer
+import faiss
+
+EMBED_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+
+class QualitativeAnalysisTool:
+    def __init__(self, embed_model_name: str = EMBED_MODEL):
+        self.embedder = SentenceTransformer(embed_model_name)
+        self.index = None
+        self.chunks = []
+
+    def _chunk_text(self, text: str, chunk_words: int = 300):
+        w = text.split()
+        return [" ".join(w[i:i+chunk_words]) for i in range(0, len(w), chunk_words)]
+
+    def index_transcripts(self, transcripts: List[Dict[str, Any]]) -> bool:
+        """
+        transcripts: [{"name":"Q1_TRANS", "local_path":"tests/data/t1.txt"}, ...]
+        Builds FAISS index and metadata self.chunks.
+        """
+        self.chunks = []
+        texts = []
+        for t in transcripts:
+            path = t.get("local_path")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    txt = f.read()
+            except Exception:
+                txt = ""
+            cks = self._chunk_text(txt)
+            for i, c in enumerate(cks):
+                meta = {"source": t.get("name"), "chunk_id": f"{t.get('name')}_c{i}"}
+                self.chunks.append({"meta": meta, "text": c})
+                texts.append(c)
+        if not texts:
+            return False
+        embeds = self.embedder.encode(texts, show_progress_bar=False)
+        dim = embeds.shape[1]
+        self.index = faiss.IndexFlatL2(dim)
+        self.index.add(embeds)
+        return True
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        if self.index is None:
+            return []
+        q_emb = self.embedder.encode([query])
+        D, I = self.index.search(q_emb, top_k)
+        results = []
+        for idx in I[0]:
+            if idx < len(self.chunks):
+                c = self.chunks[idx]
+                results.append({"chunk_id": c["meta"]["chunk_id"], "source": c["meta"]["source"], "text": c["text"][:600]})
+        return results
+
+    def analyze(self, transcripts: List[Dict[str, Any]]) -> Dict[str, Any]:
+        ok = self.index_transcripts(transcripts)
+        if not ok:
+            return {"tool":"QualitativeAnalysisTool","themes": [], "management_sentiment": {"score":0.0,"summary":"insufficient_data"}, "forward_guidance": [], "risks": []}
+        queries = {
+            "demand": "demand, growth, digital transformation, revenue growth",
+            "attrition": "attrition, employee turnover, resignations, hiring",
+            "guidance": "guidance, outlook, expect, forecast"
+        }
+        themes = []
+        for k,q in queries.items():
+            res = self.retrieve(q, top_k=5)
+            if res:
+                themes.append({"theme": k, "count": len(res), "examples": res})
+        # basic sentiment rule
+        sentiment = {"score": 0.0, "summary": "neutral"}
+        if any(t["theme"]=="demand" for t in themes):
+            sentiment = {"score": 0.3, "summary": "positive demand signals"}
+        if any(t["theme"]=="attrition" for t in themes):
+            sentiment = {"score": -0.3, "summary": "attrition concerns present"}
+        forward = []
+        for t in self.retrieve("guidance, outlook, expect", top_k=5):
+            forward.append(t)
+        risks = []
+        if any(t["theme"]=="attrition" for t in themes):
+            risks.append({"name":"attrition", "evidence":[c["chunk_id"] for t in themes if t["theme"]=="attrition" for c in t["examples"]]})
+        return {"tool":"QualitativeAnalysisTool", "themes": themes, "management_sentiment": sentiment, "forward_guidance": forward, "risks": risks}
+
+app/utils/nuber_parsing.py:
+import re
+import os
+import sys
+
+def parse_inr_number(text: str):
+    if not text:
+        return None
+    # ₹ pattern
+    m = re.search(r'₹\s*([0-9,\.]+)\s*(Cr|Crore|CR|cr)?', text)
+    if m:
+        num = m.group(1)
+        try:
+            return float(num.replace(',', ''))
+        except:
+            return None
+    m2 = re.search(r'([0-9]{1,3}(?:,[0-9]{3})+)', text)
+    if m2:
+        try:
+            return float(m2.group(1).replace(',', ''))
+        except:
+            return None
+    m3 = re.search(r'([0-9]+(\.[0-9]+)?)', text)
+    if m3:
+        try:
+            return float(m3.group(1))
+        except:
+            return None
+    return None
+
+app/main.py:
+from fastapi import FastAPI
+from app.api.endpoints import router as api_router
+
+app = FastAPI(title="TCS Financial Forecasting Agent")
+
+app.include_router(api_router, prefix="/api")
+
+@app.get("/health")
+async def health():
+    return {"status": "ok"}
+
+
