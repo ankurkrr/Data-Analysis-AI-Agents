@@ -51,6 +51,13 @@ class _FakeEmbedder:
 
 
 class QualitativeAnalysisTool:
+    """Tool for qualitative analysis of earnings transcripts using RAG pattern.
+    
+    Ensures robust analysis with:
+    1. Fallback to deterministic embeddings if sentence-transformers unavailable
+    2. Structured output format for consistent machine readability
+    3. Error handling with default values when sections can't be analyzed
+    """
     """RAG-based qualitative analysis tool for earnings call transcripts.
 
     Uses sentence-transformers for embeddings and FAISS for vector search when
@@ -63,6 +70,14 @@ class QualitativeAnalysisTool:
         self.embed_model_name = embed_model_name
         self.index = None
         self.chunks: List[Dict[str, Any]] = []
+
+        # CI / test toggle: if FORCE_FAKE_EMBEDDER is set, use the fake embedder
+        try:
+            if self.embedder is None and os.getenv("FORCE_FAKE_EMBEDDER", "0").lower() in ("1", "true", "yes"):
+                self.embedder = _FakeEmbedder(dim=64)
+        except Exception:
+            # keep silent on environment-parsing errors; do not break initialization
+            pass
 
     def _chunk_text(self, text: str, chunk_words: int = 300) -> List[str]:
         words = text.split()

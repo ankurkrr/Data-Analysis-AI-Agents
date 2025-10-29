@@ -5,13 +5,22 @@ import os
 import re
 import json
 from typing import List, Dict, Any, Optional
-import pdfplumber
 from app.utils.number_parsing import parse_inr_number
-from pdf2image import convert_from_path
-import pytesseract
 import warnings
+from langchain.tools import tool
+from app.llm.openrouter_llm import get_llm
+import math
 
-warnings.filterwarnings("ignore", category=UserWarning, module="camelot")
+# Defer heavy optional imports (pdfplumber, pdf2image, pytesseract) to runtime
+# inside the methods that need them. This avoids import-time failures in
+# environments that don't have system-level deps (poppler, tesseract).
+_HAS_PDFPLUMBER = False
+_HAS_PDF2IMAGE = False
+_HAS_PYTESSERACT = False
+try:
+    warnings.filterwarnings("ignore", category=UserWarning, module="camelot")
+except Exception:
+    pass
 
 
 # Camelot import with fallback
@@ -202,6 +211,12 @@ class FinancialDataExtractorTool:
         """Extract text using pdfplumber"""
         text = ""
         try:
+            # Lazy import pdfplumber
+            try:
+                import pdfplumber
+            except Exception:
+                return text
+
             with pdfplumber.open(pdf_path) as pdf:
                 for page in pdf.pages[:10]:  # Limit to first 10 pages
                     page_text = page.extract_text()
@@ -215,10 +230,24 @@ class FinancialDataExtractorTool:
         """Extract text using OCR (slowest method)"""
         text = ""
         try:
+            # Lazy imports
+            try:
+                from pdf2image import convert_from_path
+            except Exception:
+                return text
+
+            try:
+                import pytesseract
+            except Exception:
+                return text
+
             pages = convert_from_path(pdf_path, dpi=dpi)
             for page in pages[:max_pages]:
-                page_text = pytesseract.image_to_string(page)
-                text += "\n\n" + page_text
+                try:
+                    page_text = pytesseract.image_to_string(page)
+                    text += "\n\n" + page_text
+                except Exception:
+                    continue
         except Exception:
             pass
         return text
@@ -257,6 +286,149 @@ class FinancialDataExtractorTool:
                     })
         
         return metrics
+
+    def extract_metrics_from_text(self, text: str) -> Dict[str, Any]:
+        """Robust regex-based extractor for key financial metrics from free text.
+
+        Returns a dict mapping normalized metric keys to values and metadata.
+        """
+        patterns = {
+            "total_revenue": r"(?i)(?:revenue from operations|total income|total revenue|revenue).*?([\d,\.]+)\s*(crore|million|inr|₹)?",
+            "net_profit": r"(?i)(?:net profit|profit after tax|pat).*?([\d,\.]+)\s*(crore|million|inr|₹)?",
+            "operating_margin": r"(?i)(?:operating margin|ebit margin).*?([\d\.]+)\s*%",
+            "net_profit_margin": r"(?i)(?:net profit margin|profit margin).*?([\d\.]+)\s*%",
+            "eps": r"(?i)\b(?:eps|earnings per share)\b.*?([\d\.]+)",
+            "ebitda": r"(?i)(?:ebitda|earnings before interest).*?([\d,\.]+)\s*(crore|inr|₹)?",
+            "roe": r"(?i)(?:return on equity|roe).*?([\d\.]+)\s*%",
+            "free_cash_flow": r"(?i)(?:free cash flow|fcf).*?([\d,\.]+)\s*(crore|inr|₹)?",
+            "debt_to_equity": r"(?i)(?:debt[-\s]*to[-\s]*equity|d/?e).*?([\d\.]+)"
+        }
+
+        found = {}
+        for key, pattern in patterns.items():
+            m = re.search(pattern, text)
+            if m:
+                raw = m.group(1)
+                unit_raw = None
+                try:
+                    unit_raw = m.group(2)
+                except Exception:
+                    unit_raw = None
+
+                # Try parse using existing helper
+                val = parse_inr_number(raw)
+                if val is None:
+                    # fallback: remove commas and try float
+                    try:
+                        val = float(raw.replace(",", ""))
+                    except Exception:
+                        val = None
+
+                if val is not None and isinstance(val, (int, float)) and (not math.isnan(val)):
+                    # Normalize units: convert million -> crore (1 crore = 10 million)
+                    unit_marker = (unit_raw or "").lower() if unit_raw else ""
+                    if "million" in unit_marker and key not in ["operating_margin", "net_profit_margin", "roe", "debt_to_equity"]:
+                        try:
+                            val = float(val) / 10.0
+                        except Exception:
+                            pass
+
+                    # Default unit mapping
+                    if key in ["operating_margin", "net_profit_margin", "roe"]:
+                        unit = "%"
+                    elif key == "debt_to_equity":
+                        unit = "ratio"
+                    else:
+                        unit = "INR_Cr"
+
+                    found[key] = {"value": val, "unit": unit, "confidence": 0.6}
+
+        return {"metrics": found, "count": len(found)}
+
+    def validate_and_enrich_metrics(self, metrics: Dict[str, Any], text: str) -> Dict[str, Any]:
+        """Use the configured LLM to validate and enrich extracted metrics.
+
+        This method will attempt to call the LLM obtained from get_llm(). If the
+        LLM call fails, it will attempt lightweight deterministic enrichments
+        (e.g., compute margins where possible).
+        """
+        # Normalize input metrics
+        metrics = metrics or {}
+
+        # Build prompt for the LLM
+        prompt = f"""
+You are a financial data assistant. Given extracted metrics: {json.dumps(metrics)}
+and the report text (first 4000 chars):\n
+{text[:4000]}
+
+Please:
+1) Return a JSON object with cleaned numeric values (numbers only) for keys: total_revenue, net_profit, operating_profit, ebitda, eps, roe, free_cash_flow, debt_to_equity, operating_margin, net_profit_margin.
+2) If a margin is missing and you can compute it (e.g., operating_margin = operating_profit / total_revenue * 100), compute and include it.
+3) Standardize units to crore (INR_Cr) or percentages where appropriate.
+4) Provide a "notes" field indicating any assumptions.
+
+Return ONLY valid JSON.
+"""
+
+        llm = None
+        try:
+            llm = get_llm()
+            raw = llm._call(prompt)
+            try:
+                parsed = json.loads(raw)
+                return {"status": "ok", "metrics": parsed}
+            except Exception:
+                # LLM returned non-JSON; fallthrough to fallback behavior
+                pass
+        except Exception as e:
+            # LLM not available or failed; continue to deterministic enrichment
+            pass
+
+        # Fallback deterministic enrichments
+        enriched = dict(metrics)  # shallow copy
+
+        # Try compute operating_margin if missing and we have operating_profit and total_revenue
+        try:
+            if "operating_margin" not in enriched and "operating_profit" in enriched and "total_revenue" in enriched:
+                op = float(enriched["operating_profit"]["value"]) if isinstance(enriched["operating_profit"], dict) else float(enriched["operating_profit"])
+                rev = float(enriched["total_revenue"]["value"]) if isinstance(enriched["total_revenue"], dict) else float(enriched["total_revenue"])
+                if rev != 0:
+                    enriched["operating_margin"] = {"value": (op / rev) * 100, "unit": "%", "confidence": 0.5}
+        except Exception:
+            pass
+
+        # Compute simple rate-of-change (QoQ) if previous period values are supplied
+        try:
+            for base_key in ["total_revenue", "net_profit", "ebitda"]:
+                prev_key = f"{base_key}_prev"
+                if base_key in enriched and prev_key in enriched:
+                    cur_val = enriched[base_key]["value"] if isinstance(enriched[base_key], dict) else enriched[base_key]
+                    prev_val = enriched[prev_key]["value"] if isinstance(enriched[prev_key], dict) else enriched[prev_key]
+                    try:
+                        cur = float(cur_val)
+                        prev = float(prev_val)
+                        if prev != 0:
+                            pct = ((cur - prev) / abs(prev)) * 100.0
+                            enriched[f"{base_key}_qoq_pct"] = {"value": pct, "unit": "%", "confidence": 0.5}
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+        # Normalize nested structures to simple dict format
+        cleaned = {}
+        for k, v in enriched.items():
+            if isinstance(v, dict) and "value" in v:
+                cleaned[k] = {"value": v["value"], "unit": v.get("unit", "INR_Cr"), "confidence": v.get("confidence", 0.5)}
+            else:
+                # best-effort
+                try:
+                    cleaned[k] = {"value": float(v), "unit": "INR_Cr", "confidence": 0.4}
+                except Exception:
+                    continue
+
+        return {"status": "fallback", "metrics": cleaned, "notes": "LLM unavailable or returned non-JSON; used deterministic enrichment"}
+
     
     def _is_financial_label(self, text: str) -> bool:
         """Check if text looks like a financial metric label"""
@@ -310,3 +482,38 @@ def extract_financial_data(reports: List[Dict[str, Any]]) -> Dict[str, Any]:
     """Legacy function - delegates to the class-based tool"""
     tool = FinancialDataExtractorTool()
     return tool.extract(reports)
+
+
+@tool("extract_financial_metrics", return_direct=True)
+def extract_financial_metrics(text: str) -> dict:
+    """LangChain tool wrapper: extract financial metrics from free text.
+
+    Returns a dict: {"metrics": {...}, "count": N}
+    """
+    extractor = FinancialDataExtractorTool()
+    try:
+        return extractor.extract_metrics_from_text(text)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool("validate_and_enrich_metrics", return_direct=True)
+def validate_and_enrich_metrics_tool(metrics_input: str, text: str) -> dict:
+    """LangChain tool wrapper: validate/enrich metrics using configured LLM.
+
+    metrics_input can be a JSON string or a dict.
+    """
+    extractor = FinancialDataExtractorTool()
+    try:
+        if isinstance(metrics_input, str):
+            try:
+                metrics = json.loads(metrics_input)
+            except Exception:
+                # fallback: treat as empty
+                metrics = {}
+        else:
+            metrics = metrics_input
+
+        return extractor.validate_and_enrich_metrics(metrics, text)
+    except Exception as e:
+        return {"error": str(e)}

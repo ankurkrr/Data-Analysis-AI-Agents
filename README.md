@@ -247,6 +247,38 @@ MYSQL_DB=tcs_forecast
 EMBEDDING_MODEL=all-MiniLM-L6-v2
 ```
 
+### Fast CI / Dev toggles (safe defaults for tests)
+
+When running tests or CI you may not want to call external LLMs or load heavy native
+libraries. The project supports a few opt-in environment toggles to make CI/dev
+runs deterministic and lightweight:
+
+- `FORCE_FAKE_LLM=1` — Force the project to use a deterministic fake LLM implementation.
+  Useful for CI where you want repeatable outputs and no network calls.
+- `ALLOW_AUTO_FAKE=1` — Opt-in resilient mode: attempt to call the real LLM, and if the
+  call fails at runtime, automatically fall back to the deterministic fake LLM.
+  NOTE: This must be explicitly enabled — the project does not silently fallback by default.
+- `FORCE_FAKE_EMBEDDER=1` — Force the deterministic, fast embedder (no torch or
+  sentence-transformers). Use this in CI to avoid heavy native dependencies.
+
+When a fake/fallback LLM is used, the API response includes a metadata flag to
+help you detect synthetic outputs:
+
+```
+{
+  "metadata": {
+    "ticker": "TCS",
+    "request_id": "...",
+    "analysis_date": "...",
+    "quarters_analyzed": [...],
+    "llm_fake": true  // true when fake or fallback LLM produced the result
+  },
+  ...
+}
+```
+
+Please ensure tests and CI explicitly check `llm_fake` if they depend on real LLM behavior.
+
 ### Getting OpenRouter API Key:
 
 1. Visit https://openrouter.ai/
@@ -332,6 +364,27 @@ forecast = response.json()
 print(forecast["metadata"])
 print(forecast["forecast"])
 ```
+
+### Capabilities / Health
+
+The server exposes a small capabilities endpoint to inspect runtime modes and
+optional dependency availability without triggering heavy imports or failing.
+
+GET `/api/health/capabilities`
+
+Response example:
+
+```json
+{
+  "llm": {"forced_fake": false, "allow_auto_fake": true, "fake_output_possible": true},
+  "embedder": {"forced_fake": false, "sentence_transformers_available": false, "faiss_available": false},
+  "pdf_tools": {"camelot_available": false, "pdfplumber_available": true, "pytesseract_available": false},
+  "db": {"mysql_connector_installed": true}
+}
+```
+
+This endpoint can be used by CI or orchestration tooling to decide whether to run
+full tests (with real LLMs / native libs) or fast tests (with forced fake modes).
 
  **Response Structure** :
 

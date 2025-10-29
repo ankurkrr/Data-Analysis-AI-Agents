@@ -7,10 +7,13 @@ from typing import List, Dict
 from urllib.parse import urljoin, urlparse
 import hashlib
 import time
+from datetime import datetime
 
-DOWNLOAD_DIR = "tests/data"
+# Use data directory at project root for downloads
+DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "downloads")
 SCREENER_COMPANY_URL_TEMPLATE = "https://www.screener.in/company/{ticker}/consolidated/"
 
+# Ensure the downloads directory exists
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 def _get_tcs_ir_url(year: str = None, quarter: str = None) -> str:
@@ -148,8 +151,10 @@ def fetch_tcs_ir_reports(year: str = None, quarters: List[str] = None, consolida
                     if 'pdf' not in content_type and not pdf_url.lower().endswith('.pdf'):
                         continue
                     
-                    # Save the PDF
-                    name = f"TCS_{year}_{q}_Results"
+                    # Save the PDF with proper quarter formatting
+                    quarter_num = int(q.replace('Q',''))
+                    fiscal_year = year.replace('-', '_')
+                    name = f"TCS_Q{quarter_num}_FY{fiscal_year}_Results"
                     url_hash = hashlib.sha1(pdf_url.encode()).hexdigest()[:8]
                     fname = f"{url_hash}_{name}.pdf"
                     local_path = os.path.join(DOWNLOAD_DIR, fname)
@@ -276,8 +281,30 @@ def fetch_quarterly_documents(ticker: str, quarters: int, sources: List[str]=Non
         for idx, p in enumerate(pdf_links_unique[:max(quarters*2, 6)]):
             local = _download_file(p["href"])
             if local:
-                name = p["text"] or os.path.basename(local)
-                reports.append({"name": name, "local_path": local, "source_url": p["href"]})
+                # Extract quarter and year info from the text or filename
+                text = p["text"].lower()
+                fname = os.path.basename(local).lower()
+                
+                # Try to extract quarter and year info
+                quarter_pattern = r'q[1-4]|quarter\s*[1-4]'
+                year_pattern = r'20\d{2}[-_]?\d{2}|fy\d{2}[-_]?\d{2}'
+                
+                q_match = re.search(quarter_pattern, text) or re.search(quarter_pattern, fname)
+                y_match = re.search(year_pattern, text) or re.search(year_pattern, fname)
+                
+                if q_match and y_match:
+                    q_num = q_match.group(0)[-1]
+                    year = y_match.group(0).replace('fy', '20')
+                    name = f"TCS_Q{q_num}_FY{year}_Report"
+                else:
+                    name = p["text"] or os.path.basename(local)
+                
+                reports.append({
+                    "name": name,
+                    "local_path": local,
+                    "source_url": p["href"],
+                    "date_downloaded": datetime.now().isoformat()
+                })
             time.sleep(0.5)
 
         # Now try to find transcripts: anchors whose text looks like transcript keywords or link targets containing 'transcript' or 'concall'
@@ -329,17 +356,18 @@ def fetch_quarterly_documents(ticker: str, quarters: int, sources: List[str]=Non
             pass
 
     except Exception:
-        # If any error, fall back to returning any files in tests/data for local dev
+        # If any error, fall back to returning any files in data/test_fixtures for local dev
         # Provide a fallback to local test files (developer should place sample files)
+        test_fixtures_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data", "test_fixtures")
         fallback_reports = [
-            {"name":"Q1_SAMPLE","local_path":"tests/data/sample_report_q1.pdf"},
-            {"name":"Q4_SAMPLE","local_path":"tests/data/sample_report_q4.pdf"},
-            {"name":"Q3_SAMPLE","local_path":"tests/data/sample_report_q3.pdf"},
+            {"name":"Q1_SAMPLE","local_path":os.path.join(test_fixtures_dir, "sample_report_q1.pdf")},
+            {"name":"Q4_SAMPLE","local_path":os.path.join(test_fixtures_dir, "sample_report_q4.pdf")},
+            {"name":"Q3_SAMPLE","local_path":os.path.join(test_fixtures_dir, "sample_report_q3.pdf")},
         ]
         fallback_transcripts = [
-            {"name":"Q1_TRANSCRIPT","local_path":"tests/data/sample_transcript_q1.txt"},
-            {"name":"Q4_TRANSCRIPT","local_path":"tests/data/sample_transcript_q4.txt"},
-            {"name":"Q3_TRANSCRIPT","local_path":"tests/data/sample_transcript.txt"}
+            {"name":"Q1_TRANSCRIPT","local_path":os.path.join(test_fixtures_dir, "sample_transcript_q1.txt")},
+            {"name":"Q4_TRANSCRIPT","local_path":os.path.join(test_fixtures_dir, "sample_transcript_q4.txt")},
+            {"name":"Q3_TRANSCRIPT","local_path":os.path.join(test_fixtures_dir, "sample_transcript.txt")}
         ]
         return {"reports": fallback_reports[:quarters], "transcripts": fallback_transcripts[:max(1, quarters-1)]}
 

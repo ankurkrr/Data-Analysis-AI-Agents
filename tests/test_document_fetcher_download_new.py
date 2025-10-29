@@ -18,9 +18,10 @@ def test_fetch_tcs_ir_reports_download():
     """Test downloading TCS IR reports with detailed logging."""
     logger.info("Starting TCS IR download test")
     
-    # Ensure download directory exists
-    os.makedirs("tests/data", exist_ok=True)
-    logger.info(f"Download directory ready: tests/data")
+    # Ensure download directory exists in project root
+    downloads_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "downloads")
+    os.makedirs(downloads_dir, exist_ok=True)
+    logger.info(f"Download directory ready: {downloads_dir}")
     
     try:
         # Test with specific year and quarter that exists
